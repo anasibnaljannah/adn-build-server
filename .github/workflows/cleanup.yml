@@ -1,0 +1,17 @@
+name: cleanup-old-jobs
+on:
+  schedule: [{ cron: "17 * * * *" }]
+  workflow_dispatch: {}
+permissions: { contents: write }
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          cutoff=$(date -u -d '6 hours ago' +%s)
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            | jq -r '.[] | select(.tag_name|startswith("job-")) | "\(.id) \(.created_at)"' \
+            | while read id created; do
+                [ "$(date -u -d "$created" +%s)" -lt "$cutoff" ] && gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/$id" || true
+              done
