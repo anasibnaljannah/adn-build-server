@@ -12,14 +12,12 @@ concurrency: { group: "job-${{ inputs.job_id }}" }
 permissions: { contents: read }
 
 jobs:
-  # 1) Untrusted build: no secrets, read-only token, no persisted git credentials.
-  build:
+  # 0) Fetch the uploaded zip from the draft release (drafts need contents:write to read).
+  fetch:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
-    outputs: { kind: "${{ steps.detect.outputs.kind }}" }
+    timeout-minutes: 5
+    permissions: { contents: write }
     steps:
-      - uses: actions/checkout@v4
-        with: { persist-credentials: false }
       - name: Download input.zip from release
         env: { GH_TOKEN: "${{ github.token }}", ID: "${{ inputs.job_id }}", RID: "${{ inputs.release_id }}" }
         run: |
@@ -29,7 +27,21 @@ jobs:
           aid=$(jq -r '.assets[] | select(.name=="input.zip") | .id' <<<"$rel")
           curl -sSfL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/octet-stream" \
             "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/assets/$aid" -o "$RUNNER_TEMP/input.zip"
-          size=$(stat -c %s "$RUNNER_TEMP/input.zip"); [ "$size" -le 52428800 ] || { echo "file larger than 50 MB" > error.txt; exit 1; }
+          size=$(stat -c %s "$RUNNER_TEMP/input.zip"); [ "$size" -le 52428800 ] || { echo "file larger than 50 MB"; exit 1; }
+      - uses: actions/upload-artifact@v4
+        with: { name: input, path: "${{ runner.temp }}/input.zip", retention-days: 1 }
+
+  # 1) Untrusted build: no secrets, read-only token, no persisted git credentials.
+  build:
+    needs: fetch
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    outputs: { kind: "${{ steps.detect.outputs.kind }}" }
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/download-artifact@v4
+        with: { name: input, path: "${{ runner.temp }}" }
       - id: detect
         name: Detect project type
         run: |
@@ -89,7 +101,7 @@ jobs:
 
   # 3) Report failure so the relay can show it.
   report-failure:
-    needs: [build, sign]
+    needs: [fetch, build, sign]
     if: failure()
     runs-on: ubuntu-latest
     permissions: { contents: write }
