@@ -71,11 +71,15 @@ def gradle(proj):
     w = proj / "gradlew"
     if w.exists(): w.chmod(0o755); return ["./gradlew"]
     return ["gradle"]
-def run_gradle(proj):
+# Speed: skip lint/tests, parallel workers + build cache; configuration cache only for our own template.
+FAST_FLAGS = ["--no-daemon", "-q", "--parallel", "--build-cache", "-x", "lint", "-x", "test"]
+
+def run_gradle(proj, template=False):
     (proj / "local.properties").write_text(f"sdk.dir={ANDROID_HOME}\n")
     last = None
     for task in ("assembleRelease", "assembleDebug"):
-        r = run(gradle(proj) + [task, "--no-daemon", "-q"], proj)
+        extra = ["--configuration-cache"] if template else []
+        r = run(gradle(proj) + [task] + FAST_FLAGS + extra, proj)
         apks = list(proj.rglob("build/outputs/apk/**/*.apk"))
         if r.returncode == 0 and apks: return sorted(apks, key=lambda p: ("universal" not in p.name, len(p.name)))[0]
         last = r
@@ -101,10 +105,10 @@ def npm_install(root):
     if r.returncode != 0: fail("npm install failed: " + why(r))
 
 def build(kind, root, name, work):
-    if kind == "web": return run_gradle(web_project(root, name, work))
+    if kind == "web": return run_gradle(web_project(root, name, work), template=True)
     if kind == "android": return run_gradle(root)
     if kind == "flutter":
-        r = run(["flutter", "build", "apk", "--release"], root)
+        r = run(["flutter", "build", "apk", "--release", "--target-platform", "android-arm,android-arm64" ], root)
         apk = root / "build/app/outputs/flutter-apk/app-release.apk"
         if r.returncode != 0 or not apk.exists(): fail("flutter build failed: " + why(r))
         return apk
