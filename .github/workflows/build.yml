@@ -49,14 +49,18 @@ jobs:
           echo "kind=$(tail -1 kind.out)" >> "$GITHUB_OUTPUT"; cat kind.out
       - uses: actions/setup-java@v4
         with: { distribution: temurin, java-version: "${{ contains(fromJSON('[\"capacitor\",\"cordova\",\"react-native\",\"flutter\"]'), steps.detect.outputs.kind) && '21' || '17' }}" }
+      # Caches ~/.gradle (AGP + dependencies) between runs; the biggest speed-up for every Gradle-based type.
       - uses: gradle/actions/setup-gradle@v4
-        with: { gradle-version: "8.9", cache-disabled: true }
+        with: { gradle-version: "8.9", cache-read-only: false, cache-cleanup: on-success }
       - if: steps.detect.outputs.kind == 'flutter'
         uses: subosito/flutter-action@v2
-        with: { channel: stable }
+        with: { channel: stable, cache: true }
       - if: contains(fromJSON('["capacitor","cordova","react-native"]'), steps.detect.outputs.kind)
         uses: actions/setup-node@v4
         with: { node-version: "20" }
+      - if: contains(fromJSON('["capacitor","cordova","react-native"]'), steps.detect.outputs.kind)
+        uses: actions/cache@v4
+        with: { path: ~/.npm, key: "npm-${{ runner.os }}-${{ steps.detect.outputs.kind }}", restore-keys: "npm-${{ runner.os }}-" }
       - name: Build (unsigned)
         env: { NAME: "${{ inputs.file_name }}", GITHUB_TOKEN: "" }
         run: python3 ci/build.py build "$RUNNER_TEMP/w" "$NAME" "$RUNNER_TEMP/unsigned.apk"
@@ -86,18 +90,40 @@ jobs:
           GH_TOKEN: "${{ github.token }}"
           RID: "${{ inputs.release_id }}"
           KS_B64: "${{ secrets.SIGNING_KEYSTORE_B64 }}"
-          KS_PASS: "${{ secrets.SIGNING_PASSWORD }}"
-          KS_ALIAS: "${{ secrets.SIGNING_ALIAS || 'srv' }}"
+          KS_PASS_SVC: "${{ secrets.SIGNING_PASSWORD }}"
+          KS_ALIAS_SVC: "${{ secrets.SIGNING_ALIAS || 'srv' }}"
+          USER_KEY_SECRET: "${{ secrets.USER_KEY_SECRET }}"
         run: |
-          export KEYSTORE="$RUNNER_TEMP/ks.jks"
-          if [ -n "$KS_B64" ]; then echo "$KS_B64" | base64 -d > "$KEYSTORE"
+          set -euo pipefail
+          API="https://api.github.com/repos/$GITHUB_REPOSITORY"
+          upload() { curl -sSf -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Content-Type: application/octet-stream" \
+                       --data-binary "@$1" "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$RID/assets?name=$1" > /dev/null; }
+          trap 'rm -f "$RUNNER_TEMP"/user.* "$RUNNER_TEMP"/uk.enc "$RUNNER_TEMP"/ks.jks' EXIT
+          uk=$(gh api "repos/$GITHUB_REPOSITORY/releases/$RID" --jq '.assets[] | select(.name=="userkey.enc") | .id')
+          if [ -n "$uk" ]; then
+            # User's own key: download, delete from the release immediately, decrypt, mask.
+            curl -sSfL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/octet-stream" "$API/releases/assets/$uk" -o "$RUNNER_TEMP/uk.enc"
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$uk" > /dev/null
+            if ! node ci/decrypt_key.mjs "$RUNNER_TEMP/uk.enc" "$RUNNER_TEMP"; then
+              echo "Your signing key could not be used on this server. / تعذّر استخدام مفتاح التوقيع الخاص بك." > error.txt; upload error.txt; exit 1
+            fi
+            KS_PASS=$(cat "$RUNNER_TEMP/user.pass"); echo "::add-mask::$KS_PASS"
+            KS_ALIAS=$(cat "$RUNNER_TEMP/user.alias"); KEYSTORE="$RUNNER_TEMP/user.p12"; SIGNER=user
+          elif [ -n "$KS_B64" ]; then
+            KEYSTORE="$RUNNER_TEMP/ks.jks"; echo "$KS_B64" | base64 -d > "$KEYSTORE"; KS_PASS="$KS_PASS_SVC"; KS_ALIAS="$KS_ALIAS_SVC"; SIGNER=service
           else
             echo "::warning::No SIGNING_KEYSTORE_B64 secret: using a one-time key (APKs cannot be updated in place)"
-            export KS_PASS=$(openssl rand -hex 16) KS_ALIAS=srv
-            keytool -genkeypair -keystore "$KEYSTORE" -alias srv -keyalg RSA -keysize 2048 -validity 10000 -storepass "$KS_PASS" -keypass "$KS_PASS" -dname "CN=Adn Build (ephemeral)"
+            KEYSTORE="$RUNNER_TEMP/ks.jks"; KS_PASS=$(openssl rand -hex 16); KS_ALIAS=srv; SIGNER=ephemeral
+            keytool -genkeypair -keystore "$KEYSTORE" -alias srv -keyalg RSA -keysize 2048 -validity 10000 -storepass "$KS_PASS" -keypass "$KS_PASS" -dname "CN=Adn Build (ephemeral)" > /dev/null 2>&1
           fi
-          python3 ci/build.py sign in/unsigned.apk app.apk
-          curl -sSf -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Content-Type: application/octet-stream" --data-binary @app.apk "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$RID/assets?name=app.apk" > /dev/null
+          export KEYSTORE KS_PASS KS_ALIAS
+          if ! python3 ci/build.py sign in/unsigned.apk app.apk > /dev/null 2>&1; then
+            [ "$SIGNER" = user ] && echo "Signing with your key failed (wrong password or alias?). / فشل التوقيع بمفتاحك (كلمة مرور أو اسم مستعار خاطئ؟)" > error.txt
+            [ -f error.txt ] || echo "signing failed" > error.txt
+            upload error.txt; exit 1
+          fi
+          echo "$SIGNER" > signer.txt
+          upload app.apk; upload signer.txt
 
   # 3) Report failure so the relay can show it.
   report-failure:
@@ -111,5 +137,8 @@ jobs:
         continue-on-error: true
       - env: { GH_TOKEN: "${{ github.token }}", RID: "${{ inputs.release_id }}" }
         run: |
+          uk=$(gh api "repos/$GITHUB_REPOSITORY/releases/$RID" --jq '.assets[] | select(.name=="userkey.enc") | .id' || true)
+          [ -n "$uk" ] && gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$uk" > /dev/null || true
+          gh api "repos/$GITHUB_REPOSITORY/releases/$RID" --jq '.assets[].name' | grep -qx error.txt && exit 0
           [ -f error.txt ] || echo "build failed" > error.txt
           curl -sSf -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Content-Type: application/octet-stream" --data-binary @error.txt "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$RID/assets?name=error.txt" > /dev/null
