@@ -90,6 +90,7 @@ def web_project(web, name, work):
     pp = proj / "app/src/main/java" / pkg.replace(".", "/"); pp.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(proj / "app/src/main/java/PKGPATH"), str(pp))
     for f in [proj / "app/build.gradle", pp / "MainActivity.java"]: f.write_text(f.read_text().replace("__PKG__", pkg))
+    (proj / "app/src/main/res/values").mkdir(parents=True, exist_ok=True)
     n = html.escape(name).replace("'", "\\'").replace("@", "\\@").replace("?", "\\?")
     (proj / "app/src/main/res/values/strings.xml").write_text(f'<resources><string name="app_name">{n}</string></resources>', encoding="utf-8")
     shutil.copytree(web, proj / "app/src/main/assets/www")
